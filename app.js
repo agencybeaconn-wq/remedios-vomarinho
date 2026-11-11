@@ -200,7 +200,7 @@ function render() {
 
 function renderLogin() {
   $app.innerHTML = `<div class="login">
-    <h1>Remédios da Família</h1>
+    <h1>Remédios Vó Marinho</h1>
     <p class="muted">Entre com o usuário e a senha que você recebeu. Depois disso o celular lembra de você.</p>
     <form id="login" autocomplete="on">
       <label class="f">Usuário<input class="i" name="u" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="username" required></label>
@@ -231,6 +231,7 @@ function viewHoje() {
     ${next ? `<p class="next">Próximo: <b>${esc(next.time)}</b> · ${esc(next.med.name)} · <span data-cd="${next.at.getTime()}">${cdText(next.at)}</span></p>`
       : todays.length && done === todays.length ? `<p class="next" style="color:var(--green)"><b>Tudo de hoje foi registrado.</b></p>` : ""}
   </div>`;
+  h += reportCard();
   if (late.length) h += `<div class="card red"><b>${late.length} ${late.length === 1 ? "remédio pendente" : "remédios pendentes"}</b> com horário ultrapassado. Se já deu, toque em “Já administrei”.</div>`;
   const unverified = S.meds.filter((m) => m.active && m.kind === "continuo" && (!ready(m) || !S.schedules.some((s) => s.medication_id === m.id)));
   if (unverified.length) h += `<div class="card amber small">Fora da lista por falta de conferência, validação ou horário: ${unverified.map((m) => esc(m.name)).join(", ")}.
@@ -356,6 +357,7 @@ function viewConfig() {
     ${entry("conferencia", "Remédios e horários", ok ? "Sistema ativo · editar cadastro e horários" : "Conferência pendente")}
     ${entry("notificacoes", "Lembretes no celular", "Ativar, testar e limitações")}
     ${entry("familiares", "Familiares e acesso", "Nomes, senha e fuso horário")}
+    ${entry("relatorio", "Relatório do mês", "Horários cumpridos, atrasos e onde melhorar")}
     ${entry("historico", "Histórico", "Tudo que foi registrado e corrigido")}
     ${entry("ajuda", "Como usar", "Passo a passo simples")}
     ${S.installEvt ? `<button class="btn ghost" data-act="install">Instalar na tela inicial</button>` : ""}
@@ -516,7 +518,7 @@ function auditText(r) {
     condition_text: "condição", min_interval_hours: "intervalo", interval_confirmed: "confirmação do intervalo", admin_notes: "orientação da sonda",
     reorder_threshold: "limite de compra", tablet_strength: "dosagem do comprimido", equivalence_confirmed_at: "validação da troca de comprimido", verified_at: "conferência", active: "situação", times_per_day: "vezes por dia" };
   const ch = Object.keys(fields).filter((k) => JSON.stringify(o[k]) !== JSON.stringify(n[k])).map((k) => fields[k]);
-  if (!ch.length) return `${name}: estoque atualizado`;
+  if (!ch.length) return "";
   if (ch.length === 1 && ch[0] === "conferência") return `${name}: ${n.verified_at ? "marcado como conferido" : "conferência desfeita"}`;
   return `${name}: alterou ${ch.join(", ")}`;
 }
@@ -551,7 +553,241 @@ function viewAjuda() {
     <div class="card amber"><b>O app não substitui a equipe de saúde.</b> Ele não indica remédio, não muda dose e não diz o que fazer se uma dose for esquecida. Em dúvida, ligue para a equipe.</div>`;
 }
 
-const PAGES = { eventuais: viewEventuais, conferencia: viewConferencia, notificacoes: viewNotificacoes, familiares: viewFamiliares, historico: viewHistorico, ajuda: viewAjuda };
+
+/* ---------- RELATÓRIO DO MÊS ---------- */
+const TOL_MIN = 30;
+const ymOf = (ds) => ds.slice(0, 7);
+function monthBounds(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  return { first: `${ym}-01`, last: new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10) };
+}
+function monthName(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  return new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC", month: "long", year: "numeric" }).format(new Date(Date.UTC(y, m - 1, 15))).replace(/^./, (c) => c.toUpperCase());
+}
+function monthOnly(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  return new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC", month: "long" }).format(new Date(Date.UTC(y, m - 1, 15)));
+}
+function shiftMonth(ym, n) { const [y, m] = ym.split("-").map(Number); return new Date(Date.UTC(y, m - 1 + n, 1)).toISOString().slice(0, 7); }
+const shortDate = (ds) => `${ds.slice(8, 10)}/${ds.slice(5, 7)}`;
+const weekday = (ds) => new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC", weekday: "short" }).format(new Date(ds + "T12:00:00Z")).replace(".", "");
+// estado de uma linha num instante, a partir do histórico de alterações (em ordem)
+function stateAt(rows, current, t) {
+  let last = null;
+  for (const r of rows) { if (new Date(r.changed_at) <= t) last = r; else break; }
+  if (last) return last.new_data;
+  if (rows.length) return rows[0].old_data;
+  return current;
+}
+async function fetchAll(make) {
+  let out = [], from = 0;
+  for (;;) {
+    const r = await make().range(from, from + 999);
+    if (r.error) throw r.error;
+    out = out.concat(r.data);
+    if (r.data.length < 1000) return out;
+    from += 1000;
+  }
+}
+async function loadReport(ym) {
+  S.rep = { ym, loading: true };
+  try {
+    const { first, last } = monthBounds(ym);
+    const start = zoned(first, "00:00").toISOString(), end = zoned(addDays(last, 1), "00:00").toISOString();
+    const [adm, sch, aud] = await Promise.all([
+      fetchAll(() => sb.from("administrations").select("*")
+        .or(`and(slot_date.gte.${first},slot_date.lte.${last}),and(schedule_id.is.null,given_at.gte.${start},given_at.lt.${end})`).order("given_at")),
+      fetchAll(() => sb.from("schedules").select("*").order("created_at")),
+      fetchAll(() => sb.from("audit_log").select("table_name,row_id,action,old_data,new_data,changed_at")
+        .in("table_name", ["schedules", "medications", "families"]).order("changed_at")),
+    ]);
+    S.rep = { ym, data: computeReport(ym, adm, sch, aud) };
+  } catch (e) { S.rep = { ym, error: e }; }
+  if (S.page === "relatorio") render();
+}
+function computeReport(ym, adm, schAll, aud) {
+  const { first, last } = monthBounds(ym);
+  const now = Date.now(), today = localDate();
+  const group = (tbl) => { const m = new Map(); for (const r of aud) if (r.table_name === tbl) { if (!m.has(r.row_id)) m.set(r.row_id, []); m.get(r.row_id).push(r); } return m; };
+  const aS = group("schedules"), aM = group("medications"), aF = group("families");
+  const famRows = aF.get(S.family.id) || [];
+  const valid = adm.filter((a) => a.status === "valido");
+  const bySlot = new Map(valid.filter((a) => a.schedule_id).map((a) => [a.schedule_id + "|" + a.slot_date, a]));
+  const medName = (id) => { const m = S.meds.find((x) => x.id === id); return m ? `${m.name} ${m.strength}` : "Remédio"; };
+  const slots = [], seen = new Set();
+  const push = (date, time, medId, a) => {
+    const at = zoned(date, time);
+    let status = "sem", diff = null;
+    if (a) {
+      diff = Math.round((new Date(a.given_at) - at) / 60000);
+      status = diff > TOL_MIN ? "atraso" : diff < -TOL_MIN ? "adiantado" : "ok";
+    }
+    slots.push({ date, time, at, medId, med: medName(medId), adm: a, status, diff });
+  };
+  for (let d = first; d <= last && d <= today; d = addDays(d, 1)) {
+    const dEnd = zoned(addDays(d, 1), "00:00");
+    for (const s of schAll) {
+      const key = s.id + "|" + d;
+      const a = bySlot.get(key);
+      if (a) { seen.add(key); push(d, a.slot_time.slice(0, 5), s.medication_id, a); continue; }
+      const st = stateAt(aS.get(s.id) || [], s, dEnd);
+      if (!st || !st.active) continue;
+      const time = String(st.time_of_day).slice(0, 5);
+      const at = zoned(d, time);
+      if (now - at.getTime() < TOL_MIN * 60e3) continue; // ainda dentro do prazo
+      const fam = stateAt(famRows, S.family, at);
+      if (!fam || !fam.activated_at || new Date(fam.activated_at) >= at) continue;
+      const med = stateAt(aM.get(s.medication_id) || [], S.meds.find((m) => m.id === s.medication_id), at);
+      if (!med || !med.active || med.kind !== "continuo" || !med.verified_at || (med.tablet_strength && !med.equivalence_confirmed_at)) continue;
+      push(d, time, s.medication_id, null);
+    }
+  }
+  for (const a of valid) {
+    if (!a.schedule_id || seen.has(a.schedule_id + "|" + a.slot_date) || a.slot_date < first || a.slot_date > last) continue;
+    push(a.slot_date, a.slot_time.slice(0, 5), a.medication_id, a);
+  }
+  slots.sort((x, y) => x.at - y.at || x.med.localeCompare(y.med));
+  const count = (arr, st) => arr.filter((s) => s.status === st).length;
+  const late = slots.filter((s) => s.status === "atraso");
+  const people = new Map();
+  for (const s of slots) if (s.adm) {
+    const n = s.adm.given_by_name; if (!people.has(n)) people.set(n, { total: 0, ok: 0, atraso: 0, adiantado: 0 });
+    const p = people.get(n); p.total++; p[s.status]++;
+  }
+  const byTime = new Map();
+  for (const s of slots) { if (!byTime.has(s.time)) byTime.set(s.time, []); byTime.get(s.time).push(s); }
+  const byMed = new Map();
+  for (const s of slots) { if (!byMed.has(s.med)) byMed.set(s.med, []); byMed.get(s.med).push(s); }
+  const days = new Map();
+  for (const s of slots) { if (!days.has(s.date)) days.set(s.date, []); days.get(s.date).push(s); }
+  const eventual = new Map();
+  for (const a of valid) if (!a.schedule_id) {
+    const m = S.meds.find((x) => x.id === a.medication_id) || { unit: a.unit };
+    const k = medName(a.medication_id); if (!eventual.has(k)) eventual.set(k, { n: 0, q: 0, m }); const e = eventual.get(k); e.n++; e.q += Number(a.quantity);
+  }
+  return {
+    slots, total: slots.length, ok: count(slots, "ok"), atraso: late.length, adiantado: count(slots, "adiantado"), sem: count(slots, "sem"),
+    avgLate: late.length ? Math.round(late.reduce((t, s) => t + s.diff, 0) / late.length) : 0,
+    maxLate: late.reduce((mx, s) => (s.diff > (mx?.diff || 0) ? s : mx), null),
+    people: [...people.entries()].sort((a, b) => b[1].total - a[1].total),
+    byTime: [...byTime.entries()].map(([t, arr]) => ({ t, total: arr.length, bad: arr.filter((s) => s.status !== "ok").length, late: count(arr, "atraso"), sem: count(arr, "sem") }))
+      .sort((a, b) => a.t.localeCompare(b.t)),
+    byMed: [...byMed.entries()].map(([m, arr]) => ({ m, total: arr.length, bad: arr.filter((s) => s.status !== "ok").length })).sort((a, b) => b.bad - a.bad || a.m.localeCompare(b.m)),
+    days: [...days.entries()],
+    eventual: [...eventual.entries()],
+    corrections: adm.filter((a) => a.replaces_id).length,
+    undone: adm.filter((a) => a.status === "anulado" && !String(a.void_reason || "").startsWith("Corrigido")).length,
+  };
+}
+const pct = (n, t) => (t ? Math.round((n / t) * 100) : 0);
+function diffText(s) {
+  if (s.status === "sem") return "sem registro";
+  const m = Math.abs(s.diff);
+  if (s.status === "atraso") return `dado às ${hm(s.adm.given_at)}, ${dur(m * 60000)} de atraso`;
+  if (s.status === "adiantado") return `dado às ${hm(s.adm.given_at)}, ${dur(m * 60000)} antes`;
+  return `dado às ${hm(s.adm.given_at)}`;
+}
+function viewRelatorio() {
+  const cur = ymOf(localDate());
+  if (!S.rep || (!S.rep.loading && !S.rep.data && !S.rep.error)) S.rep = null;
+  const ym = S.rep?.ym || S.repYm || cur;
+  if (!S.rep || S.rep.ym !== ym) { S.rep = { ym, loading: true }; setTimeout(() => loadReport(ym), 0); }
+  let h = pageHead("Relatório do mês");
+  h += `<div class="monthbar noprint"><button class="back" data-act="repMonth" data-n="-1" aria-label="Mês anterior">‹</button>
+    <b>${esc(monthName(ym))}</b>
+    <button class="back" data-act="repMonth" data-n="1" aria-label="Próximo mês" ${ym >= cur ? "disabled" : ""}>›</button></div>
+    <p class="printonly"><b>Relatório de ${esc(monthName(ym))}</b></p>`;
+  if (S.rep.loading) return h + `<div class="spinner">Montando o relatório…</div>`;
+  if (S.rep.error) return h + `<div class="card red">${esc(errText(S.rep.error))}<button class="btn ghost small" data-act="repMonth" data-n="0">Tentar de novo</button></div>`;
+  const r = S.rep.data;
+  if (!r.total && !r.eventual.length) {
+    return h + `<div class="card muted">Nenhum horário previsto ${ym === cur ? "até agora neste mês" : "neste mês"}. O relatório começa a contar depois que o sistema é ativado.</div>`;
+  }
+  const bad = r.atraso + r.adiantado + r.sem;
+  h += `<div class="card">
+    <p class="small muted">${ym === cur ? "Até agora neste mês" : "No mês inteiro"}, foram ${r.total} horários de remédio.</p>
+    <p class="stock-num" style="margin-top:6px;color:${pct(r.ok, r.total) >= 90 ? "var(--green)" : pct(r.ok, r.total) >= 70 ? "var(--ink)" : "var(--red)"}">${pct(r.ok, r.total)}% <span style="font-size:19px">no horário certo</span></p>
+    <div class="stack" aria-hidden="true">
+      <i style="width:${pct(r.ok, r.total)}%;background:var(--green)"></i><i style="width:${pct(r.atraso, r.total)}%;background:var(--amber)"></i>
+      <i style="width:${pct(r.adiantado, r.total)}%;background:var(--blue)"></i><i style="width:${pct(r.sem, r.total)}%;background:var(--red)"></i></div>
+    <div class="legend">
+      <p><span class="sw" style="background:var(--green)"></span><b>${r.ok}</b> no horário <span class="muted small">(até ${TOL_MIN} min de diferença)</span></p>
+      <p><span class="sw" style="background:var(--amber)"></span><b>${r.atraso}</b> com atraso${r.atraso ? ` <span class="muted small">(em média ${dur(r.avgLate * 60000)})</span>` : ""}</p>
+      <p><span class="sw" style="background:var(--blue)"></span><b>${r.adiantado}</b> adiantados <span class="muted small">(mais de ${TOL_MIN} min antes)</span></p>
+      <p><span class="sw" style="background:var(--red)"></span><b>${r.sem}</b> sem registro</p>
+    </div></div>`;
+  // recado
+  const worst = [...r.byTime].sort((a, b) => b.bad - a.bad)[0];
+  let tip;
+  if (!bad) tip = `<b>Parabéns!</b> Todos os horários foram registrados no horário certo. Continue assim.`;
+  else {
+    const parts = [];
+    if (worst && worst.bad) parts.push(`O horário que mais precisou de atenção foi o das <b>${esc(worst.t)}</b>: ${worst.bad} de ${worst.total} fora do horário ou sem registro.`);
+    if (r.maxLate) parts.push(`O maior atraso foi em ${weekday(r.maxLate.date)}, ${shortDate(r.maxLate.date)}: ${esc(r.maxLate.med)} das ${esc(r.maxLate.time)}, ${dur(r.maxLate.diff * 60000)} depois.`);
+    if (r.sem) parts.push(`Quando der o remédio, toque em “Já administrei” na hora. Assim o horário não fica sem registro.`);
+    parts.push(`Uma ajuda: deixar um alarme no relógio do celular nos horários que mais atrasaram.`);
+    tip = parts.join(" ");
+  }
+  h += `<div class="card ${bad ? "amber" : "green"}">${tip}</div>`;
+  if (r.people.length) {
+    h += `<h2 class="sec">Por pessoa</h2><div class="card">${r.people.map(([n, p]) => `<div class="rowline">
+      <span><b>${esc(n)}</b><span class="sub">${p.total} registros</span></span>
+      <span class="right">${p.ok} no horário${p.atraso ? ` · <b style="color:var(--red)">${p.atraso} com atraso</b>` : ""}${p.adiantado ? ` · ${p.adiantado} adiantados` : ""}</span></div>`).join("")}</div>`;
+  }
+  h += `<h2 class="sec">Por horário</h2><div class="card">${r.byTime.map((t) => `<div class="rowline">
+    <span><b style="font-size:22px">${esc(t.t)}</b><span class="sub">${t.total} vezes</span></span>
+    <span class="right">${t.bad ? `${t.late ? `<b style="color:var(--red)">${t.late} com atraso</b>` : ""}${t.late && t.sem ? " · " : ""}${t.sem ? `${t.sem} sem registro` : ""}${t.bad - t.late - t.sem ? ` · ${t.bad - t.late - t.sem} adiantados` : ""}` : `<span style="color:var(--green)">✓ tudo no horário</span>`}</span></div>`).join("")}</div>`;
+  h += `<h2 class="sec">Por remédio</h2><div class="card">${r.byMed.map((m) => `<div class="rowline"><span>${esc(m.m)}</span>
+    <span class="right">${m.bad ? `<b style="color:var(--red)">${m.bad} de ${m.total} fora</b>` : `<span style="color:var(--green)">✓ ${m.total} de ${m.total}</span>`}</span></div>`).join("")}</div>`;
+  // dia a dia
+  const goodDays = r.days.filter(([, arr]) => arr.every((s) => s.status === "ok")).length;
+  h += `<h2 class="sec">Dia a dia</h2>`;
+  if (goodDays) h += `<p class="small" style="color:var(--green);font-weight:700">✓ ${goodDays} ${goodDays === 1 ? "dia" : "dias"} com todos os horários certos.</p>`;
+  for (const [d, arr] of r.days) {
+    const probs = arr.filter((s) => s.status !== "ok");
+    if (!probs.length) continue;
+    h += `<p class="hist-day">${esc(weekday(d))}, ${shortDate(d)}</p>`;
+    for (const s of probs) h += `<div class="hist"><div><b>${esc(s.time)}</b> · ${esc(s.med)}</div>
+      <div class="meta" style="color:${s.status === "sem" || s.status === "atraso" ? "var(--red)" : "inherit"}">${esc(diffText(s))}${s.adm ? ` · por ${esc(s.adm.given_by_name)}` : ""}</div></div>`;
+  }
+  if (r.eventual.length) {
+    h += `<h2 class="sec">Remédios “se necessário” no mês</h2><div class="card">${r.eventual.map(([k, e]) =>
+      `<div class="rowline"><span>${esc(k)}</span><span class="right"><b>${e.n} ${e.n === 1 ? "vez" : "vezes"}</b> · ${esc(qty(e.m, e.q))} no total</span></div>`).join("")}</div>`;
+  }
+  h += `<p class="small muted" style="margin-top:16px">${r.corrections ? `${r.corrections} ${r.corrections === 1 ? "registro foi corrigido" : "registros foram corrigidos"}. ` : ""}${r.undone ? `${r.undone} ${r.undone === 1 ? "registro foi desfeito" : "registros foram desfeitos"}. ` : ""}
+    “Sem registro” quer dizer que ninguém tocou em “Já administrei” naquele horário. Não quer dizer, por si só, que o remédio não foi dado. Este relatório não substitui a orientação da equipe de saúde.</p>
+    <div class="noprint"><button class="btn primary" data-act="repPrint">Imprimir ou salvar em PDF</button>
+    <button class="btn ghost small" data-act="repCsv">Baixar planilha do mês</button></div>`;
+  return h;
+}
+function exportReportCsv() {
+  const r = S.rep?.data; if (!r) return;
+  const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const lbl = { ok: "No horário", atraso: "Com atraso", adiantado: "Adiantado", sem: "Sem registro" };
+  let csv = "﻿DATA;HORÁRIO PREVISTO;REMÉDIO;REGISTRADO ÀS;DIFERENÇA (MIN);SITUAÇÃO;QUEM\n";
+  for (const s of r.slots) csv += [shortDate(s.date) + "/" + s.date.slice(0, 4), s.time, s.med, s.adm ? hm(s.adm.given_at) : "", s.diff ?? "", lbl[s.status], s.adm?.given_by_name || ""].map(cell).join(";") + "\n";
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `relatorio-remedios-${S.rep.ym}.csv`; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+function reportCard() {
+  const today = localDate();
+  if (Number(today.slice(8, 10)) > 7 || !S.family.activated_at) return "";
+  const prev = shiftMonth(ymOf(today), -1);
+  if (new Date(S.family.activated_at) >= zoned(`${ymOf(today)}-01`, "00:00") && !S.family.activated_at.startsWith(prev)) {
+    // sistema ativado só neste mês: ainda não há relatório anterior
+    const act = localDate(new Date(S.family.activated_at)); if (act >= `${ymOf(today)}-01`) return "";
+  }
+  let hidden = false; try { hidden = localStorage.getItem("relatorioVisto") === prev; } catch {}
+  if (hidden) return "";
+  return `<div class="card green"><b>O relatório de ${esc(monthOnly(prev))} está pronto.</b>
+    <p class="small" style="margin-top:4px">Veja como foram os horários do mês e onde dá para melhorar.</p>
+    <button class="btn primary small" data-act="openReport" data-ym="${prev}">Ver relatório</button>
+    <button class="link" data-act="hideReport" data-ym="${prev}">Ocultar</button></div>`;
+}
+
+const PAGES = { relatorio: viewRelatorio, eventuais: viewEventuais, conferencia: viewConferencia, notificacoes: viewNotificacoes, familiares: viewFamiliares, historico: viewHistorico, ajuda: viewAjuda };
 
 /* ================= folhas (modais) ================= */
 let sheetClose = null;
@@ -710,7 +946,7 @@ function wireTimes(m) {
 /* ================= ações ================= */
 const A = {
   tab: (d) => { S.page = null; S.tab = d.tab; render(); scrollTo(0, 0); },
-  page: (d) => { S.page = d.page; if (d.page === "historico") S.hist = null; history.pushState({ page: d.page }, ""); render(); scrollTo(0, 0); },
+  page: (d) => { S.page = d.page; if (d.page === "historico") S.hist = null; if (d.page === "relatorio") { S.rep = null; S.repYm = null; } history.pushState({ page: d.page }, ""); render(); scrollTo(0, 0); },
   back: () => history.back(),
   reload: () => { S.loading = !S.family; render(); reload(); subscribe(); },
   closeSheet: () => closeSheet(),
@@ -814,6 +1050,11 @@ const A = {
     S.family.timezone = v; render(); toast("Fuso horário salvo.");
   },
   histTab: (d) => { S.histTab = d.k; render(); },
+  repMonth: (d) => { const ym = shiftMonth(S.rep?.ym || ymOf(localDate()), Number(d.n)); if (ym > ymOf(localDate())) return; S.repYm = ym; S.rep = { ym, loading: true }; render(); loadReport(ym); },
+  repPrint: () => window.print(),
+  repCsv: () => exportReportCsv(),
+  openReport: (d) => { S.repYm = d.ym; S.rep = null; S.page = "relatorio"; history.pushState({ page: "relatorio" }, ""); render(); scrollTo(0, 0); },
+  hideReport: (d) => { try { localStorage.setItem("relatorioVisto", d.ym); } catch {} render(); },
   export: () => exportCsv(),
 
   editMed: (d) => sheetMed(S.meds.find((m) => m.id === d.id)),
@@ -1015,7 +1256,7 @@ function localReminders() {
   });
 }
 function updateBadge(n) {
-  document.title = n ? `(${n}) Remédios` : "Remédios";
+  document.title = n ? `(${n}) Remédios Vó Marinho` : "Remédios Vó Marinho";
   try { if (navigator.setAppBadge) n ? navigator.setAppBadge(n) : navigator.clearAppBadge(); } catch {}
 }
 

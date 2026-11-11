@@ -1,5 +1,5 @@
-const CACHE = "remedios-v1";
-const SHELL = ["./", "index.html", "styles.css?v=1", "app.js?v=1", "config.js", "manifest.webmanifest",
+const CACHE = "remedios-v2";
+const SHELL = ["./", "index.html", "styles.css?v=2", "app.js?v=2", "config.js", "manifest.webmanifest",
   "icons/icon-192.png", "icons/icon-512.png", "icons/badge-96.png"];
 
 self.addEventListener("install", (e) => {
@@ -35,7 +35,7 @@ self.addEventListener("fetch", (e) => {
 self.addEventListener("push", (e) => {
   let d = {};
   try { d = e.data.json(); } catch { d = { title: "Lembrete de remédio", body: e.data ? e.data.text() : "" }; }
-  e.waitUntil(self.registration.showNotification(d.title || "Lembrete de remédio", {
+  e.waitUntil(self.registration.showNotification(d.title || "Remédios Vó Marinho", {
     body: d.body || "Abra o app para ver.",
     tag: d.tag || "remedios",
     renotify: true,
